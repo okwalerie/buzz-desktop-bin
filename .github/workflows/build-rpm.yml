@@ -74,8 +74,8 @@ jobs:
         run: |
           set -euo pipefail
           cargo build --release \
-            -p buzz-acp -p buzz-agent -p buzz-dev-mcp \
-            -p git-credential-nostr -p buzz-cli
+            -p buzz-acp -p buzz-agent -p buzz-backend-kubernetes \
+            -p buzz-dev-mcp -p git-credential-nostr -p buzz-cli
           ./scripts/bundle-sidecars.sh
 
       - name: Build the native aarch64 RPM
