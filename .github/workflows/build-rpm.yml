@@ -62,6 +62,8 @@ jobs:
             "$UPSTREAM_REPOSITORY" "$UPSTREAM_REF" "$(git rev-parse HEAD)" "$version" > ../BUILD-PROVENANCE.txt
 
       - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
+        with:
+          working-directory: upstream
 
       - name: Install Desktop JavaScript dependencies
         working-directory: upstream
