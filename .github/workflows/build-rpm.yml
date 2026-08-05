@@ -1,0 +1,122 @@
+name: Build Asahi-native Buzz RPM
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: Immutable upstream Buzz tag or commit SHA
+        required: true
+        default: desktop-v0.5.5
+        type: string
+  schedule:
+    - cron: '17 4 * * 1'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: buzz-rpm-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPOSITORY: https://github.com/block/buzz.git
+  UPSTREAM_REF: ${{ inputs.upstream_ref || 'desktop-v0.5.5' }}
+
+jobs:
+  build:
+    # Native ARM64 avoids cross-compilation and produces a Fedora-compatible RPM.
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 180
+    outputs:
+      version: ${{ steps.metadata.outputs.version }}
+      source_sha: ${{ steps.metadata.outputs.source_sha }}
+    steps:
+      - name: Install Linux build dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential ca-certificates curl file git libasound2-dev \
+            libayatana-appindicator3-dev libgtk-3-dev librsvg2-dev libssl-dev \
+            libwebkit2gtk-4.1-dev libxdo-dev patchelf pkg-config rpm xdg-utils
+
+      - name: Check out the selected upstream release
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --branch "$UPSTREAM_REF" "$UPSTREAM_REPOSITORY" upstream \
+            || git clone --filter=blob:none "$UPSTREAM_REPOSITORY" upstream
+          cd upstream
+          git checkout --detach "$UPSTREAM_REF"
+          test -f desktop/package.json
+
+      - name: Record immutable provenance
+        id: metadata
+        run: |
+          set -euo pipefail
+          cd upstream
+          echo "source_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          version="$(node -p "require('./desktop/package.json').version")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          printf 'upstream_repository: %s\nupstream_ref: %s\nsource_sha: %s\nversion: %s\narchitecture: aarch64\n' \
+            "$UPSTREAM_REPOSITORY" "$UPSTREAM_REF" "$(git rev-parse HEAD)" "$version" > ../BUILD-PROVENANCE.txt
+
+      - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
+
+      - name: Install Desktop JavaScript dependencies
+        working-directory: upstream
+        run: just desktop-install-ci
+
+      - name: Build native sidecars
+        working-directory: upstream
+        run: |
+          set -euo pipefail
+          cargo build --release \
+            -p buzz-acp -p buzz-agent -p buzz-dev-mcp \
+            -p git-credential-nostr -p buzz-cli
+          ./scripts/bundle-sidecars.sh
+
+      - name: Build the native aarch64 RPM
+        working-directory: upstream/desktop
+        env:
+          CMAKE_POLICY_VERSION_MINIMUM: '3.5'
+        run: pnpm tauri build --verbose --ci --bundles rpm --config src-tauri/tauri.conf.json
+
+      - name: Stage and checksum RPM
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          mapfile -t rpms < <(find upstream/desktop/src-tauri/target/release/bundle/rpm -name '*.aarch64.rpm' -type f)
+          ((${#rpms[@]} == 1)) || { echo "Expected one aarch64 RPM, found ${#rpms[@]}" >&2; exit 1; }
+          cp "${rpms[0]}" artifacts/
+          cp BUILD-PROVENANCE.txt artifacts/
+          (cd artifacts && sha256sum * > SHA256SUMS)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: buzz-rpm-aarch64
+          path: artifacts/
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: buzz-rpm-aarch64
+          path: artifacts
+      - name: Publish a uniquely versioned release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.build.outputs.version }}
+          SOURCE_SHA: ${{ needs.build.outputs.source_sha }}
+          UPSTREAM_REF: ${{ env.UPSTREAM_REF }}
+        run: |
+          set -euo pipefail
+          tag="buzz-desktop-v${VERSION}-asahi.${GITHUB_RUN_NUMBER}"
+          gh release create "$tag" artifacts/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Buzz Desktop ${VERSION} for Fedora Asahi" \
+            --notes "Native aarch64 Fedora RPM built from Block Buzz.\n\nUpstream ref: \`$UPSTREAM_REF\`\nSource commit: \`$SOURCE_SHA\`\n\nThis is an unsigned community build; verify \`SHA256SUMS\` before installing."
