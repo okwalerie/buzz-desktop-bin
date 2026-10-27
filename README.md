@@ -30,11 +30,17 @@ sudo dnf install ./Buzz-*-1.aarch64.rpm
 
 ## Provenance and trust
 
-- Source is cloned directly from the immutable upstream `block/buzz` release tag selected in the workflow dispatch form.
+- Source is fetched directly from the selected upstream `block/buzz` release tag or full commit SHA, then checked out detached. The exact source commit is recorded.
 - The release notes record the upstream tag and commit.
 - Each release includes a `SHA256SUMS` file. Verify it before installation.
 - Builds are unsigned. Fedora will warn about this for a locally downloaded RPM; that is expected until an RPM signing key is explicitly configured.
 
 ## Build workflow
 
-Run **Actions → Build Asahi-native Buzz RPM → Run workflow**. The default upstream source is `desktop-v0.5.5`. The workflow uses GitHub-hosted ARM64 Linux runners and publishes a GitHub Release after a successful RPM build.
+Run **Actions → Build Asahi-native Buzz RPM → Run workflow**. Leave `upstream_ref` blank to build the latest stable Desktop release, or enter an explicit `desktop-vX.Y.Z` tag or full commit SHA to rebuild a specific source.
+
+The weekly scheduled build also discovers the latest stable Desktop release. Discovery checks all upstream release pages, excludes drafts, prereleases, and non-Desktop releases, and chooses the highest numeric version. If discovery fails or finds no matching release, the workflow fails rather than rebuilding an old fallback.
+
+The workflow uses GitHub-hosted ARM64 Linux runners and publishes a GitHub Release after a successful RPM build. Each release records the resolved upstream ref and exact source commit in its notes and `BUILD-PROVENANCE.txt`.
+
+After publishing, it keeps only the three newest community RPM releases by publication time and removes older releases and their assets. Rebuilds count as separate releases. It leaves Git tags and unrelated releases intact. Publishing and pruning share one concurrency group so runs cannot race.

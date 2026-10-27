@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       upstream_ref:
-        description: Immutable upstream Buzz tag or commit SHA
-        required: true
-        default: desktop-v0.5.5
+        description: Upstream Desktop release tag or full commit SHA (blank = latest stable Desktop release)
+        required: false
+        default: ''
         type: string
   schedule:
     - cron: '17 4 * * 1'
@@ -15,12 +15,12 @@ permissions:
   contents: write
 
 concurrency:
-  group: buzz-rpm-${{ github.ref }}
+  group: buzz-rpm-release
   cancel-in-progress: false
 
 env:
   UPSTREAM_REPOSITORY: https://github.com/block/buzz.git
-  UPSTREAM_REF: ${{ inputs.upstream_ref || 'desktop-v0.5.5' }}
+  UPSTREAM_REPO: block/buzz
 
 jobs:
   build:
@@ -30,7 +30,30 @@ jobs:
     outputs:
       version: ${{ steps.metadata.outputs.version }}
       source_sha: ${{ steps.metadata.outputs.source_sha }}
+      upstream_ref: ${{ steps.resolve.outputs.upstream_ref }}
     steps:
+      - name: Resolve the upstream Desktop release
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_REF: ${{ inputs.upstream_ref }}
+        run: |
+          set -euo pipefail
+          ref="$REQUESTED_REF"
+          if [[ -z "$ref" ]]; then
+            # Ignore other release lanes, drafts, and prereleases. Sort versions
+            # numerically, not lexically or by publication date (backports).
+            tags="$(gh api --paginate "repos/$UPSTREAM_REPO/releases?per_page=100" \
+              --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name | select(test("^desktop-v[0-9]+\\.[0-9]+\\.[0-9]+$"))')"
+            [[ -n "$tags" ]] || { echo "No stable Desktop release found" >&2; exit 1; }
+            mapfile -t sorted_tags < <(printf '%s\n' "$tags" | sort -V)
+            ref="${sorted_tags[-1]}"
+          fi
+          [[ "$ref" =~ ^desktop-v[0-9]+\.[0-9]+\.[0-9]+$ || "$ref" =~ ^[0-9a-fA-F]{40}$ ]] \
+            || { echo "Expected a Desktop release tag or full commit SHA" >&2; exit 1; }
+          echo "upstream_ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "Selected upstream: $ref"
+
       - name: Install Linux build dependencies
         env:
           DEBIAN_FRONTEND: noninteractive
@@ -42,16 +65,25 @@ jobs:
             libwebkit2gtk-4.1-dev libxdo-dev patchelf pkg-config rpm xdg-utils
 
       - name: Check out the selected upstream release
+        env:
+          UPSTREAM_REF: ${{ steps.resolve.outputs.upstream_ref }}
         run: |
           set -euo pipefail
-          git clone --filter=blob:none --branch "$UPSTREAM_REF" "$UPSTREAM_REPOSITORY" upstream \
-            || git clone --filter=blob:none "$UPSTREAM_REPOSITORY" upstream
+          git init upstream
           cd upstream
-          git checkout --detach "$UPSTREAM_REF"
+          git remote add origin "$UPSTREAM_REPOSITORY"
+          if [[ "$UPSTREAM_REF" == desktop-v* ]]; then
+            git fetch --depth=1 origin "refs/tags/$UPSTREAM_REF"
+          else
+            git fetch --depth=1 origin "$UPSTREAM_REF"
+          fi
+          git checkout --detach FETCH_HEAD
           test -f desktop/package.json
 
       - name: Record immutable provenance
         id: metadata
+        env:
+          UPSTREAM_REF: ${{ steps.resolve.outputs.upstream_ref }}
         run: |
           set -euo pipefail
           cd upstream
@@ -114,7 +146,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.build.outputs.version }}
           SOURCE_SHA: ${{ needs.build.outputs.source_sha }}
-          UPSTREAM_REF: ${{ env.UPSTREAM_REF }}
+          UPSTREAM_REF: ${{ needs.build.outputs.upstream_ref }}
         run: |
           set -euo pipefail
           tag="buzz-desktop-v${VERSION}-asahi.${GITHUB_RUN_NUMBER}"
@@ -122,3 +154,17 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --title "Buzz Desktop ${VERSION} for Fedora Asahi" \
             --notes "Native aarch64 Fedora RPM built from Block Buzz.\n\nUpstream ref: \`$UPSTREAM_REF\`\nSource commit: \`$SOURCE_SHA\`\n\nThis is an unsigned community build; verify \`SHA256SUMS\` before installing."
+
+      - name: Keep only the three newest community RPM releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Fetch the complete inventory before deleting anything. Only manage
+          # this workflow's published releases; preserve unrelated releases/tags.
+          obsolete="$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100" | \
+            jq -r '[.[][] | select(.draft == false and .prerelease == false) | select(.tag_name | test("^buzz-desktop-v[0-9]+\\.[0-9]+\\.[0-9]+-asahi\\.[0-9]+$"))] | sort_by(.published_at, .id) | reverse | .[3:][] | .tag_name')"
+          while IFS= read -r tag; do
+            [[ -n "$tag" ]] || continue
+            gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes
+          done <<< "$obsolete"
